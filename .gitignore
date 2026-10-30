@@ -1,0 +1,12 @@
+# Model weights and exports (brief: do not commit weights)
+*.pt
+*.onnx
+*.mlpackage/
+
+# Python
+__pycache__/
+.venv/
+
+# Outputs
+*.mp4
+*.jsonl
