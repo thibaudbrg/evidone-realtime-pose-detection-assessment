@@ -2,12 +2,43 @@
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 TEXT_COLOR = (255, 255, 255)  # white
 OUTLINE_COLOR = (0, 0, 0)  # black outline, so the text is readable on any background
+
+
+@dataclass
+class BenchmarkStats:
+    """Accumulate the baseline time spent reading, inferring and drawing frames."""
+
+    frames: int = 0
+    read_seconds: float = 0.0
+    infer_seconds: float = 0.0
+    draw_seconds: float = 0.0
+
+    def add(self, read_seconds: float, infer_seconds: float, draw_seconds: float) -> None:
+        """Record one processed frame."""
+        self.frames += 1
+        self.read_seconds += read_seconds
+        self.infer_seconds += infer_seconds
+        self.draw_seconds += draw_seconds
+
+    def report(self) -> str:
+        """Return average timings and FPS for the processed frames."""
+        if self.frames == 0:
+            return "Benchmark processed 0 frames."
+        total_seconds = self.read_seconds + self.infer_seconds + self.draw_seconds
+        return (
+            f"Benchmark ({self.frames} frames): "
+            f"{self.frames / max(total_seconds, 1e-9):.1f} FPS | "
+            f"read {self.read_seconds / self.frames * 1000:.1f} ms | "
+            f"infer {self.infer_seconds / self.frames * 1000:.1f} ms | "
+            f"draw {self.draw_seconds / self.frames * 1000:.1f} ms"
+        )
 
 
 class FpsMeter:
