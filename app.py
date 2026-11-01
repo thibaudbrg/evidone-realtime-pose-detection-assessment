@@ -9,7 +9,8 @@ import torch
 from ultralytics.engine.results import Boxes
 from ultralytics.trackers.byte_tracker import BYTETracker
 
-from cli import check_device, load_model, make_tracker, open_camera, open_outputs, parse_args
+from capture import FrameReader
+from cli import check_device, load_model, make_tracker, open_camera, open_outputs, open_video, parse_args
 from pose import draw_pose, hide_face, privacy_box
 from smoothing import FaceHold, KeypointSmoother
 from stats import BenchmarkStats, FpsMeter, draw_stats, model_ms
@@ -36,8 +37,10 @@ def main() -> None:
     if args.threads is not None:
         torch.set_num_threads(args.threads)
     model = load_model(args.model)  # before the camera, so a bad model fails without turning it on
-    cap = open_camera(args.camera)
-    outputs = open_outputs(cap, args.save, args.log_path)  # exits with a clear message if --save or --log can't be written
+    is_camera = args.video is None
+    cap = open_camera(args.camera) if is_camera else open_video(args.video)
+    outputs = open_outputs(cap, args.save, args.log_path, realtime=is_camera)  # exits with a clear message if --save or --log can't be written
+    frames = FrameReader(cap, keep_latest_only=is_camera) if args.threaded else cap  # both have the same read()
     tracker = make_tracker()
     detect_conf = min(PRIVACY_CONF, args.conf)  # detect at the lower threshold, so --conf below 0.15 still finds those people
     fps_meter = FpsMeter()
@@ -52,9 +55,9 @@ def main() -> None:
     try:
         while True:
             read_start = time.perf_counter()
-            ok, frame = cap.read() # ok is a bool indicating if the frame was read successfully, frame is the image array
+            ok, frame = frames.read() # ok is a bool indicating if the frame was read successfully, frame is the image array; threaded: usually already waiting
             read_seconds = time.perf_counter() - read_start
-            if not ok:
+            if not ok or frame is None:  # end of the video, or the camera stopped
                 break
             if args.mirror:
                 # Flip left-right like a selfie. Done before the model, so keypoints match what is displayed.
@@ -128,6 +131,8 @@ def main() -> None:
             if key == ord("s"):
                 show_skeleton = not show_skeleton
     finally:
+        if isinstance(frames, FrameReader):
+            frames.stop()  # stop the reader thread before closing the camera it reads from
         cap.release() # release the video capture object
         outputs.close()
         cv2.destroyAllWindows() # destroy all the windows created by OpenCV

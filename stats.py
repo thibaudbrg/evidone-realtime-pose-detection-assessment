@@ -19,9 +19,12 @@ class BenchmarkStats:
     read_seconds: float = 0.0
     infer_seconds: float = 0.0
     draw_seconds: float = 0.0
+    start: float | None = None  # wall-clock time when the first frame was recorded
 
     def add(self, read_seconds: float, infer_seconds: float, draw_seconds: float) -> None:
         """Record one processed frame."""
+        if self.start is None:
+            self.start = time.perf_counter() - (read_seconds + infer_seconds + draw_seconds)  # count the first frame too
         self.frames += 1
         self.read_seconds += read_seconds
         self.infer_seconds += infer_seconds
@@ -31,10 +34,10 @@ class BenchmarkStats:
         """Return average timings and FPS for the processed frames."""
         if self.frames == 0:
             return "Benchmark processed 0 frames."
-        total_seconds = self.read_seconds + self.infer_seconds + self.draw_seconds
+        wall_seconds = time.perf_counter() - (self.start or 0.0)  # real elapsed time, so work done in other threads is not double-counted
         return (
             f"Benchmark ({self.frames} frames): "
-            f"{self.frames / max(total_seconds, 1e-9):.1f} FPS | "
+            f"{self.frames / max(wall_seconds, 1e-9):.1f} FPS | "
             f"read {self.read_seconds / self.frames * 1000:.1f} ms | "
             f"infer {self.infer_seconds / self.frames * 1000:.1f} ms | "
             f"draw {self.draw_seconds / self.frames * 1000:.1f} ms"

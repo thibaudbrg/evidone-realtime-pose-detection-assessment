@@ -11,9 +11,17 @@ import numpy as np
 class OutputManager:
     """Write only processed frames and explicit inference results."""
 
-    def __init__(self, video_path: str | None, log_path: str | None, fps: float, frame_size: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        video_path: str | None,
+        log_path: str | None,
+        fps: float,
+        frame_size: tuple[int, int],
+        realtime: bool,
+    ) -> None:
         """Open both outputs now, so a bad path fails at startup instead of in the middle of a run."""
         self._fps = fps or 30.0  # some cameras report 0 FPS, so fall back to a common value
+        self._realtime = realtime  # camera: match wall-clock time; video file: keep every frame exactly once
         self._writer: cv2.VideoWriter | None = None
         self._log_file = None
         self._start: float | None = None  # time of the first saved frame
@@ -39,13 +47,10 @@ class OutputManager:
     ) -> None:
         """Save one processed frame and its log line."""
         if self._writer is not None:
-            now = time.perf_counter()
-            if self._start is None:
-                self._start = now
-            due = int((now - self._start) * self._fps) + 1  # how many frames the video should hold by now, at its FPS
-            for _ in range(max(1, due - self._written)):  # repeat a frame when we process slower than the camera, so the video plays at real speed
+            copies = self._copies_due() if self._realtime else 1  # a video file already has the right number of frames
+            for _ in range(copies):
                 self._writer.write(frame)
-                self._written += 1
+            self._written += copies
         if self._log_file is not None:
             self._log_file.write(json.dumps({
                 "frame": frame_number,
@@ -54,6 +59,14 @@ class OutputManager:
                 "persons": persons,
             }) + "\n")  # one JSON object per line (JSONL)
             self._log_file.flush()  # write to disk now, so the log survives a crash
+
+    def _copies_due(self) -> int:
+        """How many times to write this camera frame, so the video plays at real speed."""
+        now = time.perf_counter()
+        if self._start is None:
+            self._start = now
+        due = int((now - self._start) * self._fps) + 1  # how many frames the video should hold by now, at its FPS
+        return max(1, due - self._written)  # repeat a frame when we process slower than the camera
 
     def close(self) -> None:
         """Release all output resources."""

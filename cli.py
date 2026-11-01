@@ -19,13 +19,17 @@ ANONYMIZATION_MODES = ("blur", "pixelate", "fill")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Real-time pose detection with face anonymization.")
-    parser.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
+    source = parser.add_mutually_exclusive_group()  # a camera or a video file, not both
+    source.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
+    source.add_argument("--video", metavar="PATH", help="read a video file instead of a camera (default: off)")
     parser.add_argument("--conf", type=float, default=0.4,
                         help="minimum person confidence, between 0 and 1 (default: 0.4)")
     parser.add_argument("--device", choices=["cpu", "mps"], default="cpu",
                         help="where the model runs: cpu, or mps = the Apple Silicon GPU (default: cpu)")
-    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True,
-                        help="flip the image left-right like a selfie (default: on, --no-mirror to turn off)")
+    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=None,
+                        help="flip the image left-right like a selfie (default: on for a camera, off for a video)")
+    parser.add_argument("--threaded", action=argparse.BooleanOptionalAction, default=True,
+                        help="read frames in a background thread (default: on, --no-threaded to compare FPS)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"path to a YOLO pose model (default: {DEFAULT_MODEL}, downloaded if absent)")
     parser.add_argument("--mode", choices=ANONYMIZATION_MODES, default="blur",
@@ -45,6 +49,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--benchmark must be 0 or greater, got {args.benchmark}")
     if args.threads is not None and args.threads < 1:
         parser.error(f"--threads must be at least 1, got {args.threads}")
+    if args.mirror is None:
+        args.mirror = args.video is None  # a selfie camera looks natural mirrored, a recorded video does not
     return args
 
 
@@ -83,11 +89,24 @@ def open_camera(index: int) -> cv2.VideoCapture:
     return cap
 
 
-def open_outputs(cap: cv2.VideoCapture, video_path: str | None, log_path: str | None) -> OutputManager:
+def open_video(path: str) -> cv2.VideoCapture:
+    """Open a video file, or exit with code 1 and a clear message."""
+    if not Path(path).is_file():
+        sys.exit(f"Error: video file not found: {path}")
+    cap = cv2.VideoCapture(path)
+    ok = cap.isOpened() and cap.read()[0]  # opened and has at least one frame
+    if not ok:
+        cap.release()
+        sys.exit(f"Error: could not read video file {path}. Is it a format OpenCV can decode?")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind, so the test read above does not skip the first frame
+    return cap
+
+
+def open_outputs(cap: cv2.VideoCapture, video_path: str | None, log_path: str | None, realtime: bool) -> OutputManager:
     """Open --save and --log at startup, or exit with code 1 and a clear message."""
     frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))  # (width, height), the flip keeps it
     try:
-        return OutputManager(video_path, log_path, cap.get(cv2.CAP_PROP_FPS), frame_size)
+        return OutputManager(video_path, log_path, cap.get(cv2.CAP_PROP_FPS), frame_size, realtime)
     except OSError as exc:  # e.g. the folder does not exist or is read-only
         cap.release()  # turn the camera off before leaving
         sys.exit(f"Error: could not open output file: {exc}")
