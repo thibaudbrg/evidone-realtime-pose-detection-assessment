@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 KPT_CONF = 0.5  # keypoints the model is less sure about are not drawn
+PRIVACY_KPT_CONF = 0.3  # lower bar for hiding a face than for drawing it: a rough face position beats no box at all
 KPT_COLOR = (0, 255, 0)  # OpenCV colours are BGR, so this is green
 LINE_COLOR = (255, 128, 0)  # light blue
 FACE_BOX_COLOR = (0, 0, 255)  # red
@@ -38,6 +39,9 @@ FACE_PAD_BOTTOM = 0.6
 EYE_EAR_TO_HEAD = 2.0  # head width ≈ 2 × the distance from an eye to the ear on the same side
 ONE_POINT_TO_HEAD = 0.5  # with a single face point, head width ≈ half the person's box width
 MIN_FACE_SIZE = 20  # pixels: far-away faces still get a box big enough to hide them
+# Last resort when neither face points nor shoulders are confident: hide the top of the person's box
+TOP_HEIGHT_OF_BOX = 0.25  # a standing person's head is in the top quarter of their box
+TOP_HEIGHT_OF_WIDTH = 0.6  # a close-up (wide box) needs a taller strip to reach the chin
 # Blur strength: the face is shrunk to this many pixels across before blurring, whatever its size,
 # so near (big) and far (small) faces are equally hidden. Lower = blurrier.
 BLUR_CELLS = 12
@@ -72,9 +76,9 @@ def draw_pose(
     person_threshold: float | None = None,
 ) -> None:
     """Draw the skeleton lines and keypoint dots of every person, in place."""
-    people = zip(kpts_xy, kpts_conf) if person_conf is None or person_threshold is None else (
+    people = zip(kpts_xy, kpts_conf, strict=True) if person_conf is None or person_threshold is None else (
         (person_xy, keypoint_conf)
-        for person_xy, keypoint_conf, confidence in zip(kpts_xy, kpts_conf, person_conf)
+        for person_xy, keypoint_conf, confidence in zip(kpts_xy, kpts_conf, person_conf, strict=True)
         if confidence >= person_threshold
     )
     for this_person_xy, this_person_conf in people:
@@ -84,7 +88,7 @@ def draw_pose(
                 xa, ya = this_person_xy[a]
                 xb, yb = this_person_xy[b]
                 cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), LINE_COLOR, 2, cv2.LINE_AA)
-        for (x, y), conf in zip(this_person_xy, this_person_conf):
+        for (x, y), conf in zip(this_person_xy, this_person_conf, strict=True):
             if conf >= KPT_CONF:
                 cv2.circle(frame, (int(x), int(y)), 4, KPT_COLOR, -1, cv2.LINE_AA)
 
@@ -92,7 +96,7 @@ def draw_pose(
 def face_angle(person_xy: np.ndarray, person_conf: np.ndarray) -> float:
     """How much the head is tilted, read from the eye line or ear line."""
     for a, b in [(1, 2), (3, 4)]:
-        if person_conf[a] >= KPT_CONF and person_conf[b] >= KPT_CONF:
+        if person_conf[a] >= PRIVACY_KPT_CONF and person_conf[b] >= PRIVACY_KPT_CONF:
             dx, dy = person_xy[a] - person_xy[b]
             if dx < 0:
                 dx, dy = -dx, -dy
@@ -104,13 +108,13 @@ def eye_ear_distance(person_xy: np.ndarray, person_conf: np.ndarray) -> float:
     """Return the largest confident eye-to-ear distance."""
     dists = [float(np.linalg.norm(person_xy[eye] - person_xy[ear]))
              for eye, ear in [(1, 3), (2, 4)]
-             if person_conf[eye] >= KPT_CONF and person_conf[ear] >= KPT_CONF]
+             if person_conf[eye] >= PRIVACY_KPT_CONF and person_conf[ear] >= PRIVACY_KPT_CONF]
     return max(dists, default=0.0)
 
 
 def face_box(person_xy: np.ndarray, person_conf: np.ndarray, person_w: float) -> np.ndarray | None:
     """Return a tilted face box, or None if no face point is confident."""
-    pts = np.array([person_xy[k] for k in FACE_KPTS if person_conf[k] >= KPT_CONF])
+    pts = np.array([person_xy[k] for k in FACE_KPTS if person_conf[k] >= PRIVACY_KPT_CONF])
     if len(pts) == 0:
         return None
 
@@ -142,7 +146,7 @@ def face_box(person_xy: np.ndarray, person_conf: np.ndarray, person_w: float) ->
 def fallback_head_box(person_xy: np.ndarray, person_conf: np.ndarray) -> np.ndarray | None:
     """Estimate a head box above the shoulders when no face point is confident."""
     left_shoulder, right_shoulder = 5, 6
-    if person_conf[left_shoulder] < KPT_CONF or person_conf[right_shoulder] < KPT_CONF:
+    if person_conf[left_shoulder] < PRIVACY_KPT_CONF or person_conf[right_shoulder] < PRIVACY_KPT_CONF:
         return None
     shoulder_mid = (person_xy[left_shoulder] + person_xy[right_shoulder]) / 2
     shoulder_vector = person_xy[right_shoulder] - person_xy[left_shoulder]
@@ -157,7 +161,7 @@ def fallback_head_box(person_xy: np.ndarray, person_conf: np.ndarray) -> np.ndar
         v = -v
     head_width = max(0.65 * shoulder_width, MIN_FACE_SIZE)
     head_height = max(0.9 * shoulder_width, MIN_FACE_SIZE)
-    if person_conf[11] >= KPT_CONF and person_conf[12] >= KPT_CONF:
+    if person_conf[11] >= PRIVACY_KPT_CONF and person_conf[12] >= PRIVACY_KPT_CONF:
         hip_mid = (person_xy[11] + person_xy[12]) / 2
         torso_length = float(np.linalg.norm(hip_mid - shoulder_mid))
         head_width = max(head_width, 0.35 * torso_length)
@@ -173,12 +177,33 @@ def fallback_head_box(person_xy: np.ndarray, person_conf: np.ndarray) -> np.ndar
     return np.array(corners).astype(np.int32)
 
 
-def grow_box(corners: np.ndarray, factor: float) -> np.ndarray:
-    """Grow a polygon around its centre, keeping a held privacy box conservative."""
-    center = corners.mean(axis=0)
-    grown = center + (corners - center) * (1 + factor)
-    # Round away from the centre so small boxes still grow by at least a pixel.
-    return np.where(grown < center, np.floor(grown), np.ceil(grown)).astype(np.int32)
+def top_of_box(person_xyxy: np.ndarray) -> np.ndarray:
+    """Last-resort head box: the top strip of the person's detection box, where the head usually is."""
+    x1, y1, x2, y2 = person_xyxy
+    width, height = x2 - x1, y2 - y1
+    strip = min(height, max(TOP_HEIGHT_OF_BOX * height, TOP_HEIGHT_OF_WIDTH * width))  # never taller than the person's box
+    return np.array([[x1, y1], [x2, y1], [x2, y1 + strip], [x1, y1 + strip]]).astype(np.int32)  # same 4-corner format as the other boxes
+
+
+def head_box(person_xy: np.ndarray, person_conf: np.ndarray, person_w: float) -> np.ndarray | None:
+    """Face box from the face points, else from the shoulders, else None."""
+    box = face_box(person_xy, person_conf, person_w)  # None if no face point is confident
+    return box if box is not None else fallback_head_box(person_xy, person_conf)  # None if no shoulder pair is confident
+
+
+def privacy_box(
+    raw_xy: np.ndarray,
+    smoothed_xy: np.ndarray,
+    person_conf: np.ndarray,
+    person_xyxy: np.ndarray,
+) -> np.ndarray:
+    """The region to hide for one detected person. Never None: every detected person gets something hidden."""
+    person_w = float(person_xyxy[2] - person_xyxy[0])  # width of the person's detection box
+    raw_box = head_box(raw_xy, person_conf, person_w)  # where the head is in this frame
+    if raw_box is None:
+        return top_of_box(person_xyxy)  # no confident face point or shoulder: hide the top of the person's box
+    smoothed_box = head_box(smoothed_xy, person_conf, person_w)  # steadier, but may lag behind a fast movement
+    return raw_box if smoothed_box is None else union_boxes(raw_box, smoothed_box)  # cover both, so smoothing never uncovers the face
 
 
 def union_boxes(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -221,3 +246,9 @@ def anonymize(frame: np.ndarray, corners: np.ndarray, mode: str) -> None:
     mask = np.zeros(roi.shape[:2], np.uint8)
     cv2.fillPoly(mask, [corners - np.array([x1, y1], np.int32)], 255)
     cv2.copyTo(anonymized, mask, roi)
+
+
+def hide_face(frame: np.ndarray, corners: np.ndarray, mode: str) -> None:
+    """Anonymize a face box and outline it in red, in place."""
+    anonymize(frame, corners, mode)
+    cv2.polylines(frame, [corners], True, FACE_BOX_COLOR, 2, cv2.LINE_AA)  # polylines, not rectangle, because the box can be tilted; OpenCV clips at the image border

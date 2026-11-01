@@ -2,32 +2,32 @@
 
 import sys
 import time
-from typing import cast
 
 import cv2
 import numpy as np
 import torch
-from ultralytics.engine.results import Results
+from ultralytics.engine.results import Boxes
+from ultralytics.trackers.byte_tracker import BYTETracker
 
-from cli import check_device, load_model, open_camera, parse_args, to_numpy
-from output import OutputManager
-from pose import (
-    FACE_BOX_COLOR,
-    anonymize,
-    draw_pose,
-    face_box,
-    fallback_head_box,
-    grow_box,
-    union_boxes,
-)
-from smoothing import KeypointSmoother
+from cli import check_device, load_model, make_tracker, open_camera, open_outputs, parse_args
+from pose import draw_pose, hide_face, privacy_box
+from smoothing import FaceHold, KeypointSmoother
 from stats import BenchmarkStats, FpsMeter, draw_stats, model_ms
 
 WINDOW_NAME = "Pose + Face Anonymization"
 QUIT_KEYS = {ord("q"), 27}  # 27 is the Esc key code
+MODE_KEYS = {ord("b"): "blur", ord("p"): "pixelate", ord("f"): "fill"}  # key -> anonymization mode
 PRIVACY_CONF = 0.15  # low threshold: missing a person is worse than an extra anonymization
-HOLD_FRAMES = 10  # keep anonymizing a tracked person for about a third of a second
-HOLD_GROWTH = 0.05  # grow a held box because the person may move while undetected
+MAX_FAILED_FRAMES = 30  # stop after about one second of inference errors in a row
+
+
+def track_ids(tracker: BYTETracker, boxes: Boxes, frame: np.ndarray) -> np.ndarray:
+    """Give each detected person its tracker ID, or -1 if the tracker is not following them (yet)."""
+    ids = np.full(len(boxes), -1)  # -1 = new person not confirmed yet, or confidence too low to start a track
+    tracks = tracker.update(boxes, frame)  # one row per tracked person: [x1, y1, x2, y2, track_id, score, cls, detection_index]
+    if len(tracks):
+        ids[tracks[:, 7].astype(int)] = tracks[:, 4].astype(int)  # put each track ID at the index of its detection
+    return ids
 
 
 def main() -> None:
@@ -37,14 +37,17 @@ def main() -> None:
         torch.set_num_threads(args.threads)
     model = load_model(args.model)  # before the camera, so a bad model fails without turning it on
     cap = open_camera(args.camera)
+    outputs = open_outputs(cap, args.save, args.log_path)  # exits with a clear message if --save or --log can't be written
+    tracker = make_tracker()
+    detect_conf = min(PRIVACY_CONF, args.conf)  # detect at the lower threshold, so --conf below 0.15 still finds those people
     fps_meter = FpsMeter()
+    keypoint_smoother = KeypointSmoother()
+    face_hold = FaceHold()  # keeps faces hidden for a few frames when the model misses someone
+    benchmark = BenchmarkStats()
     mode = args.mode
     show_skeleton = True
-    tracked_boxes: dict[int, tuple[np.ndarray, int]] = {} # person_id -> (last face box, number of frames missed since last seen)
-    keypoint_smoother = KeypointSmoother()
-    benchmark = BenchmarkStats()
-    outputs = OutputManager(args.save, args.log_path, cap.get(cv2.CAP_PROP_FPS))
     frame_number = 0
+    failed_frames = 0  # inference errors in a row
 
     try:
         while True:
@@ -59,110 +62,58 @@ def main() -> None:
 
             inference_start = time.perf_counter()
             inference_error: str | None = None
-            result: Results | None = None
             try:
-                # nms=False selects YOLO26's NMS-free head (Ultralytics otherwise still runs NMS by default)
-                # persist=True keeps ByteTrack's person identities between frames.
-                result = cast(list[Results], model.track( #track is like predict but keeps id between frame of each person
+                result = model.predict(  # predict, not track: every detection comes back, even a person seen for the first time
                     frame,
-                    conf=PRIVACY_CONF, # PRIVACY_CONF is 0.15, so detect more ppl for safety (anonymize all above .15, and draw skeleton only for > .4)
+                    conf=detect_conf,  # anonymize everyone above 0.15, draw the skeleton only above --conf
                     device=args.device,
-                    tracker="bytetrack.yaml",
-                    persist=True,
-                    nms=False,
+                    nms=False,  # selects YOLO26's NMS-free head (Ultralytics otherwise still runs NMS by default)
                     verbose=False,
-                ))[0]  # track returns a list (one result per image), and we pass only one frame
+                )[0]  # predict returns a list (one result per image), and we pass only one frame
+                boxes = result.boxes.cpu().numpy()  # OpenCV and the tracker need numpy arrays in CPU memory
+                ids = track_ids(tracker, boxes, frame)
+                failed_frames = 0
             except Exception as exc:
+                result = None
                 inference_error = str(exc)
+                failed_frames += 1
                 print(f"Error: inference failed on frame {frame_number}: {exc}", file=sys.stderr)
+                if failed_frames >= MAX_FAILED_FRAMES:
+                    sys.exit(f"Error: inference failed {failed_frames} frames in a row, stopping.")  # finally still releases the camera
             infer_seconds = time.perf_counter() - inference_start
             draw_start = time.perf_counter()
 
+            persons = []  # what goes into the --log file for this frame
             if result is None:
-                # Never display or save a raw frame if inference fails.
-                frame = np.zeros_like(frame)
-                kpts = None
-                kpts_xy: np.ndarray = np.empty((0, 17, 2))
-                persons_ids = []
-                persons_conf = []
-                seen_ids = set()
-                person_count = 0
+                frame = np.zeros_like(frame)  # never display or save a raw frame if inference fails
                 speed = {}
             else:
-                kpts = result.keypoints
-                kpts_xy = np.empty((0, 17, 2))
-                persons_ids = []
-                persons_conf = []
-                seen_ids: set[int] = set()
-                person_count = len(result)
                 speed = result.speed
+                kpts = result.keypoints.cpu().numpy()
+                kpts_xy = kpts.xy  # (people, 17, 2): x, y of each keypoint
+                kpts_conf = kpts.conf if kpts.conf is not None else np.ones(kpts_xy.shape[:2])  # (people, 17); a model without keypoint confidence counts every point as sure
+                smoothed_xy = np.array(
+                    [keypoint_smoother.update(int(i), xy) for i, xy in zip(ids, kpts_xy, strict=True)]
+                ).reshape(-1, 17, 2)  # reshape keeps the (people, 17, 2) shape when nobody is detected
 
-            smoothed_kpts_xy: list[np.ndarray] = []
-            if result is not None and kpts is not None and kpts.conf is not None and result.boxes is not None:
-                kpts_xy, kpts_conf = to_numpy(kpts.xy), to_numpy(kpts.conf)
-                persons_w = to_numpy(result.boxes.xywh)[:, 2]  # width of each person's detection box
-                persons_conf = to_numpy(result.boxes.conf)  # confidence of each person's detection
-                persons_ids = (
-                    to_numpy(result.boxes.id)
-                    if result.boxes.id is not None
-                    else np.full(len(kpts_xy), -1)
-                )
-                for this_person_xy, this_person_conf, person_w, person_id in zip(
-                    kpts_xy, kpts_conf, persons_w, persons_ids
+                for raw_xy, smooth_xy, conf, person_xyxy, track_id, person_conf in zip(
+                    kpts_xy, smoothed_xy, kpts_conf, boxes.xyxy, ids, boxes.conf, strict=True
                 ):
-                    track_id = int(person_id)
-                    if track_id >= 0:
-                        seen_ids.add(track_id)
-                    held_box = False
-                    smoothed_xy = keypoint_smoother.update(track_id, this_person_xy)
-                    smoothed_kpts_xy.append(smoothed_xy)
-                    box = face_box(this_person_xy, this_person_conf, person_w) # normal face box, None if no face point is confident
-                    if box is None:
-                        box = fallback_head_box(this_person_xy, this_person_conf) # fallback head box, None if no shoulder pair is confident
-                    smoothed_box = face_box(smoothed_xy, this_person_conf, person_w)
-                    if smoothed_box is None:
-                        smoothed_box = fallback_head_box(smoothed_xy, this_person_conf)
-                    if box is not None and smoothed_box is not None:
-                        box = union_boxes(box, smoothed_box)
-                    if box is None and track_id in tracked_boxes:
-                        previous_box, missed = tracked_boxes[track_id]
-                        missed += 1
-                        box = grow_box(previous_box, HOLD_GROWTH) # grow the box because the person may move while undetected
-                        tracked_boxes[track_id] = (box, missed)
-                        held_box = True
-                    if box is not None:
-                        if track_id >= 0 and not held_box:
-                            tracked_boxes[track_id] = (box, 0) # reset the missed counter for this person
-                        anonymize(frame, box, mode)
-                        # A tilted box is a 4-sided polygon, so polylines instead of rectangle.
-                        # OpenCV clips the drawing at the image border by itself.
-                        cv2.polylines(frame, [box], True, FACE_BOX_COLOR, 2, cv2.LINE_AA)
+                    box = privacy_box(raw_xy, smooth_xy, conf, person_xyxy)  # face points, else shoulders, else top of the person's box
+                    face_hold.seen(int(track_id), box)  # remember it in case the model misses this person next frame
+                    hide_face(frame, box, mode)
+                    persons.append({"track_id": int(track_id), "confidence": float(person_conf), "keypoints": raw_xy.tolist()})
+
+                seen_ids = {int(i) for i in ids if i >= 0}  # people the tracker found in this frame
+                for box in face_hold.missing_boxes(seen_ids):  # people missed for a frame or two keep their face hidden
+                    hide_face(frame, box, mode)
+                keypoint_smoother.remove(seen_ids | face_hold.ids)  # forget the smoothing of people who are gone
+
                 if show_skeleton:
-                    draw_pose(frame, np.array(smoothed_kpts_xy), kpts_conf, persons_conf, args.conf) # after anonymization, so the skeleton stays visible on top
+                    draw_pose(frame, smoothed_xy, kpts_conf, boxes.conf, args.conf)  # after anonymization, so the skeleton stays visible on top
 
-            for track_id, (previous_box, missed) in list(tracked_boxes.items()):
-                if track_id in seen_ids:
-                    continue
-                missed += 1
-                if missed > HOLD_FRAMES: # if a person has been missed for more than HOLD_FRAMES, we stop tracking them
-                    del tracked_boxes[track_id]
-                    continue
-                box = grow_box(previous_box, HOLD_GROWTH) # keep growing the box for each missed frame, because the person may move while undetected
-                tracked_boxes[track_id] = (box, missed)
-                anonymize(frame, box, mode)
-                cv2.polylines(frame, [box], True, FACE_BOX_COLOR, 2, cv2.LINE_AA)
-
-            keypoint_smoother.remove(seen_ids | set(tracked_boxes))
-            draw_stats(frame, fps_meter.tick(), model_ms(speed), person_count) # once per frame
+            draw_stats(frame, fps_meter.tick(), model_ms(speed), len(persons)) # once per frame
             draw_seconds = time.perf_counter() - draw_start
-            persons = [
-                {
-                    "track_id": int(person_id),
-                    "confidence": float(person_conf),
-                    "keypoints": person_xy.tolist(),
-                }
-                for person_id, person_conf, person_xy in zip(persons_ids, persons_conf, kpts_xy)
-            ]
             outputs.write(frame_number, frame, inference_error is None, inference_error, persons)
             benchmark.add(read_seconds, infer_seconds, draw_seconds)
             frame_number += 1
@@ -171,15 +122,10 @@ def main() -> None:
                 break
             cv2.imshow(WINDOW_NAME, frame) # display the frame in a window
             key = cv2.waitKey(1) & 0xFF
-            if key in QUIT_KEYS:
+            if key in QUIT_KEYS or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:  # < 1 = window closed with its X button
                 break
-            if key == ord("b"):
-                mode = "blur"
-            elif key == ord("p"):
-                mode = "pixelate"
-            elif key == ord("f"):
-                mode = "fill"
-            elif key == ord("s"):
+            mode = MODE_KEYS.get(key, mode)  # b, p or f switch the mode; any other key keeps it
+            if key == ord("s"):
                 show_skeleton = not show_skeleton
     finally:
         cap.release() # release the video capture object

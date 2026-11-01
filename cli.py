@@ -5,9 +5,13 @@ import sys
 from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
 from ultralytics import YOLO
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.utils import YAML, IterableSimpleNamespace
+from ultralytics.utils.checks import check_yaml
+
+from output import OutputManager
 
 DEFAULT_MODEL = "yolo26n-pose.pt"
 ANONYMIZATION_MODES = ("blur", "pixelate", "fill")
@@ -79,6 +83,21 @@ def open_camera(index: int) -> cv2.VideoCapture:
     return cap
 
 
-def to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
-    """Ultralytics returns tensors (possibly on the GPU); OpenCV needs numpy arrays in CPU memory."""
-    return x.cpu().numpy() if isinstance(x, torch.Tensor) else x
+def open_outputs(cap: cv2.VideoCapture, video_path: str | None, log_path: str | None) -> OutputManager:
+    """Open --save and --log at startup, or exit with code 1 and a clear message."""
+    frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))  # (width, height), the flip keeps it
+    try:
+        return OutputManager(video_path, log_path, cap.get(cv2.CAP_PROP_FPS), frame_size)
+    except OSError as exc:  # e.g. the folder does not exist or is read-only
+        cap.release()  # turn the camera off before leaving
+        sys.exit(f"Error: could not open output file: {exc}")
+
+
+def make_tracker() -> BYTETracker:
+    """Create the ByteTrack tracker that gives each person an ID that stays the same between frames.
+
+    We call the tracker ourselves instead of model.track(), because model.track() hides people the
+    tracker has not confirmed yet (their first frame), so the face of a new person would leak.
+    """
+    config = YAML.load(check_yaml("bytetrack.yaml"))  # Ultralytics' default ByteTrack settings
+    return BYTETracker(IterableSimpleNamespace(**config))  # the tracker reads its settings as attributes
